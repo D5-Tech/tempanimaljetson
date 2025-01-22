@@ -1,176 +1,199 @@
-
-
-# # Install OpenCV (optimized for headless systems)
+# sudo apt-get install libopencv-dev python3-opencv
+# Install required libraries
+# sudo apt-get install python3-opencv python3-pip
 # pip3 install opencv-python-headless
-
-# # Install PyTorch (compatible with Jetson Nano)
-# pip3 install torch torchvision
-
-# # Install YOLOv8 and the Ultralytics library
-# pip3 install ultralytics
-
-# # Install Pillow for image handling
-# pip3 install Pillow
-
-# # Install Hugging Face Transformers for classification
-# pip3 install transformers
-
-# # Install TeleBot for Telegram bot integration
-# pip3 install telebot
-
-# # Install Requests for API handling (e.g., Blynk, Telegram)
-# pip3 install requests
-
-
-# sudo apt-get install python3-pip libopenblas-base libopenmpi-dev libjpeg-dev zlib1g-dev
-# pip3 install numpy torch==1.10.0 torchvision==0.11.0
+# pip3 install google-generativeai
+# pip3 install cvzone
+# pip3 install numpy
+# pip3 install streamlit
+# pip3 install pillow
 
 
 
-
-
-
-
-
-
+import cvzone
 import cv2
-import torch
-import torchvision.transforms as transforms
+from cvzone.HandTrackingModule import HandDetector
+import numpy as np
+import google.generativeai as genai
 from PIL import Image
-from transformers import AutoFeatureExtractor, AutoModelForImageClassification
+
+import streamlit as st
 import time
-import requests
-import telebot
-from ultralytics import YOLO
 
-# Initialize the YOLO model (optimized for Jetson Nano; TensorRT recommended for further optimization)
-yolo_model = YOLO('yolov8n.pt')  # Load YOLO nano model (ensure the file exists in the working directory)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Use GPU if available
-yolo_model.to(device)
-
-# Load a specialized model for precise classification
-classifier_name = "microsoft/resnet-50"
-feature_extractor = AutoFeatureExtractor.from_pretrained(classifier_name)
-classifier_model = AutoModelForImageClassification.from_pretrained(classifier_name).to(device)
+# Page configuration
+st.set_page_config(layout="wide")
+st.title("Math with Gestures")
 
 # Initialize the webcam
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Set resolution to 640x480 for optimal performance
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap = cv2.VideoCapture(1)
+cap.set(3, 1280)  # Width
+cap.set(4, 720)  # Height
 
-# Image transformation for classification
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+# Create the layout
+col1, col2 = st.columns([3, 2])
 
-# Animal categories mapping
-animal_categories = {
-    'elephant': 'Elephant', 'african_elephant': 'Elephant', 'indian_elephant': 'Elephant', 'loxodonta_africana': 'Elephant',
-    'peacock': 'Peacock',
-    'pig': 'Pig', 'wild_boar': 'Pig', 'domestic_pig': 'Pig', 'sus_scrofa': 'Pig',
-    'wire-haired_fox_terrier': 'Wire-haired Fox Terrier', 'fox_terrier': 'Wire-haired Fox Terrier',
-    'macaque': 'Macaque',
-}
+# Camera view column
+with col1:
+    # Create a placeholder for the video feed
+    frame_placeholder = st.empty()
+    run = st.checkbox('Start/Stop', value=True)
 
-current_category = ""
+# Result column
+with col2:
+    st.header("Answer")
+    result_placeholder = st.empty()
+    status_placeholder = st.empty()
 
-# Blynk API token and URLs
-blynk_url_on = "https://blynk.cloud/external/api/update?token=Iom3jPBDZK0SSrML2osPq3047m3u&v12=1"
-blynk_url_off = "https://blynk.cloud/external/api/update?token=Iom3jPBDZK0SSrML2osPq3047m3u&v12=0"
+# Initialize hand detector
+detector = HandDetector(
+    staticMode=False,
+    maxHands=1,
+    modelComplexity=1,
+    detectionCon=0.7,
+    minTrackCon=0.5
+)
 
-# Telegram bot settings
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# Initialize Gemini AI
+try:
+    genai.configure(api_key="AIzaSyCoAQ8islij94Hu9bLXgZH6pGW4oYpT1X4")
+    model = genai.GenerativeModel('gemini-1.5-flash')
+except Exception as e:
+    st.error(f"Failed to initialize Gemini AI: {str(e)}")
+    model = None
 
-# Function to send a Telegram message
-def send_telegram_message(message):
+# Initialize variables
+prev_pos = None
+canvas = None
+last_api_call = 0
+API_CALL_COOLDOWN = 2  # seconds
+processing = False
+
+
+def get_hand_info(img):
+    """Detect hands and return finger status"""
     try:
-        bot.send_message(TELEGRAM_CHAT_ID, message)
+        hands, img = detector.findHands(img, draw=False, flipType=True)
+        if hands:
+            hand = hands[0]
+            lm_list = hand["lmList"]
+            fingers = detector.fingersUp(hand)
+            return fingers, lm_list
+        return None
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        st.error(f"Hand detection error: {str(e)}")
+        return None
 
-# Function to draw text with a bold border
-def draw_bold_text(img, text, pos, font, font_scale, text_color, font_thickness):
-    border_color = (0, 0, 0)
-    border_thickness = font_thickness + 2
-    cv2.putText(img, text, pos, font, font_scale, border_color, border_thickness, cv2.LINE_AA)
-    cv2.putText(img, text, pos, font, font_scale, text_color, font_thickness, cv2.LINE_AA)
 
-# Create a named window for full-screen display
-cv2.namedWindow('Animal Detection', cv2.WND_PROP_FULLSCREEN)
-cv2.setWindowProperty('Animal Detection', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+def draw(info, prev_pos, canvas, img):
+    """Handle drawing operations"""
+    if canvas is None:
+        canvas = np.zeros_like(img)
 
-recently_detected = set()  # Track recently detected animals
+    fingers, lm_list = info
+    current_pos = None
 
-# Main loop for real-time detection
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Error: Camera frame not available")
-        break
+    # Drawing mode (index finger)
+    if fingers == [0, 1, 0, 0, 0]:
+        current_pos = tuple(lm_list[8][0:2])
+        if prev_pos is None:
+            prev_pos = current_pos
+        cv2.line(canvas, current_pos, prev_pos, (0, 0, 255), 10)
 
-    # Resize frame to 640x480 for consistency
-    frame = cv2.resize(frame, (640, 480))
+    # Clear canvas (thumb)
+    elif fingers == [1, 0, 0, 0, 0]:
+        canvas = np.zeros_like(img)
+        status_placeholder.info("Canvas cleared")
 
-    # Perform object detection using YOLO
-    results = yolo_model(frame)
-    detected_target_animal = False
+    return current_pos, canvas
 
-    for result in results:
-        boxes = result.boxes.cpu().numpy()
-        for box in boxes:
-            class_id = int(box.cls[0])
-            class_name = yolo_model.names[class_id]
 
-            # Focus on specific animals
-            if class_name in ['bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'monkey']:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])  # Extract bounding box coordinates
-                animal_image = frame[y1:y2, x1:x2]
-                pil_image = Image.fromarray(cv2.cvtColor(animal_image, cv2.COLOR_BGR2RGB))
-                inputs = feature_extractor(images=pil_image, return_tensors="pt").to(device)
+def send_to_ai(model, canvas, fingers):
+    """Process image with Gemini AI"""
+    global last_api_call, processing
 
-                with torch.no_grad():
-                    outputs = classifier_model(**inputs)
+    try:
+        if not model:
+            status_placeholder.warning("AI model not initialized")
+            return None
 
-                predicted_class_idx = outputs.logits.argmax(-1).item()
-                predicted_class = classifier_model.config.id2label[predicted_class_idx].lower()
-                confidence = torch.nn.functional.softmax(outputs.logits, dim=-1)[0, predicted_class_idx].item()
+        if fingers == [1, 1, 1, 0, 0] and not processing:
+            current_time = time.time()
+            if current_time - last_api_call < API_CALL_COOLDOWN:
+                status_placeholder.info("Please wait before sending another request")
+                return None
 
-                # Update current category
-                current_category = animal_categories.get(predicted_class, predicted_class)
+            processing = True
+            status_placeholder.info("Processing math problem...")
 
-                print(f"Detected: {predicted_class}, Categorized as: {current_category}")
+            try:
+                pil_image = Image.fromarray(canvas)
+                response = model.generate_content(["Solve this math problem", pil_image])
+                last_api_call = current_time
+                status_placeholder.success("Problem processed successfully")
+                return response.text
+            except Exception as api_error:
+                status_placeholder.error(f"API error: {str(api_error)}")
+                return None
+            finally:
+                processing = False
 
-                # Check if it's a target animal
-                if current_category in ['Elephant', 'Peacock', 'Pig', 'Wire-haired Fox Terrier'] or \
-                   any(animal in predicted_class for animal in ['elephant', 'peacock', 'pig', 'boar', 'fox_terrier']):
-                    detected_target_animal = True
-                    if current_category not in recently_detected:
-                        print(f"{current_category} detected, activating LED and sending Telegram message")
-                        requests.get(blynk_url_on)
-                        send_telegram_message(f"Detected: {current_category}")
-                        time.sleep(3)
-                        requests.get(blynk_url_off)
-                        recently_detected.add(current_category)
+    except Exception as e:
+        status_placeholder.error(f"Processing error: {str(e)}")
+        processing = False
+        return None
 
-                # Draw bounding box and label
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                label = f'{predicted_class}: {confidence:.2f}'
-                draw_bold_text(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    # Clear recently_detected set if no target animal is detected
-    if not detected_target_animal:
-        recently_detected.clear()
+def main():
+    global prev_pos, canvas
 
-    # Display the current animal category
-    draw_bold_text(frame, f"Category: {current_category}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-    cv2.imshow('Animal Detection', frame)
+    if not cap.isOpened():
+        st.error("Could not open camera")
+        return
 
-    # Exit the loop if 'q' is pressed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    try:
+        while run:
+            # Read frame from camera
+            ret, img = cap.read()
+            if not ret:
+                st.error("Failed to get frame from camera")
+                break
 
-cap.release()
-cv2.destroyAllWindows()
+            # Flip the frame horizontally
+            img = cv2.flip(img, 1)
+
+            # Initialize canvas if needed
+            if canvas is None:
+                canvas = np.zeros_like(img)
+
+            # Get hand information
+            hand_info = get_hand_info(img)
+            if hand_info:
+                fingers, _ = hand_info
+
+                # Handle drawing
+                prev_pos, canvas = draw(hand_info, prev_pos, canvas, img)
+
+                # Process with AI
+                if not processing:
+                    result = send_to_ai(model, canvas, fingers)
+                    if result:
+                        result_placeholder.markdown(f"### Result:\n{result}")
+
+            # Combine the original image with the canvas
+            combined_img = cv2.addWeighted(img, 0.7, canvas, 0.3, 0)
+
+            # Display the combined image
+            frame_placeholder.image(combined_img, channels="BGR", use_column_width=True)
+
+            # Add a small delay to reduce CPU usage
+            time.sleep(0.01)
+
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+    finally:
+        # Clean up
+        cap.release()
+
+
+if __name__ == "__main__":
+    main()
